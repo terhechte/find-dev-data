@@ -1,0 +1,23 @@
+[package]
+name = "find-dev-data"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A macOS disk explorer for developer artifacts and local AI models"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+egui_extras = "0.34.3"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
