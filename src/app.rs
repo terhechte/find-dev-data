@@ -78,6 +78,8 @@ pub struct App {
     sort: Sort,
     descending: bool,
     selected: Option<PathBuf>,
+    pending_delete: Option<PathBuf>,
+    trash_receiver: Option<Receiver<(PathBuf, Result<(), String>)>>,
     has_scanned: bool,
     was_cancelled: bool,
     stopping: bool,
@@ -133,6 +135,8 @@ impl App {
             sort: Sort::Size,
             descending: true,
             selected: None,
+            pending_delete: None,
+            trash_receiver: None,
             has_scanned: false,
             was_cancelled: false,
             stopping: false,
@@ -156,7 +160,7 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        if self.running() {
+        if self.running() || self.trash_receiver.is_some() {
             return;
         }
         let root = self.home.as_ref().map_or_else(
@@ -215,6 +219,33 @@ impl App {
     }
 
     fn receive(&mut self) {
+        if let Some(receiver) = &self.trash_receiver {
+            match receiver.try_recv() {
+                Ok((path, result)) => {
+                    match result {
+                        Ok(()) => {
+                            self.findings.retain(|finding| finding.path != path);
+                            if self.selected.as_ref() == Some(&path) {
+                                self.selected = None;
+                            }
+                            self.notice = Some(format!("Moved {} to Trash.", path.display()));
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!(
+                                "Could not move {} to Trash: {error}",
+                                path.display()
+                            ))
+                        }
+                    }
+                    self.trash_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.notice = Some("The Trash operation stopped unexpectedly. Check the folder in Finder and scan again.".into());
+                    self.trash_receiver = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let mut finished = false;
         if let Some(receiver) = &self.receiver {
             // A bounded per-frame drain keeps very fast discovery from delaying interaction.
@@ -362,7 +393,7 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Read-only by design")
+                        RichText::new("Scans are read-only")
                             .size(12.0)
                             .color(Color32::from_rgb(205, 218, 226)),
                     );
@@ -471,7 +502,7 @@ impl App {
                             if ui.add_enabled(!self.stopping, egui::Button::new(if self.stopping { "Stopping…" } else { "Stop scan" })).clicked() {
                                 self.cancel.store(true, Ordering::Relaxed); self.stopping = true;
                             }
-                        } else if ui.add(egui::Button::new(RichText::new(if self.has_scanned { "Scan again" } else { "Start scan" }).color(Color32::WHITE).strong()).fill(ACCENT).min_size(Vec2::new(116.0, 35.0))).clicked() {
+                        } else if ui.add_enabled(self.trash_receiver.is_none(), egui::Button::new(RichText::new(if self.has_scanned { "Scan again" } else { "Start scan" }).color(Color32::WHITE).strong()).fill(ACCENT).min_size(Vec2::new(116.0, 35.0))).clicked() {
                             self.start(ui.ctx());
                         }
                         ui.add_enabled_ui(!running, |ui| { ui.checkbox(&mut self.prefs.include_volumes, "External volumes").on_hover_text("Include mounted disks under /Volumes. Network disks may take longer."); });
@@ -626,7 +657,7 @@ impl App {
             .column(Column::remainder().at_least(220.0))
             .column(Column::initial(155.0).range(115.0..=220.0))
             .column(Column::initial(108.0).range(90.0..=150.0))
-            .column(Column::exact(72.0))
+            .column(Column::exact(145.0))
             .min_scrolled_height(120.0)
             .max_scroll_height(height - 34.0)
             .header(33.0, |mut row| {
@@ -716,11 +747,20 @@ impl App {
                         });
                     });
                     let mut reveal = false;
+                    let mut delete = false;
                     row.col(|ui| {
                         reveal = ui
                             .small_button("Reveal")
                             .on_hover_text("Show in Finder")
                             .clicked();
+                        delete = ui.add_enabled(
+                            cfg!(target_os = "macos") && !self.running() && self.trash_receiver.is_none() && path.to_str().is_some(),
+                            egui::Button::new("Delete").small(),
+                        ).on_hover_text(if path.to_str().is_none() {
+                            "Cannot delete a folder whose path cannot be displayed as text."
+                        } else {
+                            "Move this folder to Trash after confirmation. Available after the scan finishes."
+                        }).clicked();
                     });
                     let response = row.response();
                     if response.clicked() {
@@ -742,6 +782,9 @@ impl App {
                     }
                     if reveal {
                         self.reveal(&path);
+                    }
+                    if delete {
+                        self.pending_delete = Some(path);
                     }
                 });
             });
@@ -838,14 +881,16 @@ impl App {
                     ui.separator();
                 }
                 ui.horizontal(|ui| {
-                    if self.running() {
+                    if self.running() || self.trash_receiver.is_some() {
                         ui.spinner();
                     } else {
                         let (dot, _) =
                             ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
                         ui.painter().circle_filled(dot.center(), 3.5, ACCENT);
                     }
-                    let status = if self.running() {
+                    let status = if self.trash_receiver.is_some() {
+                        "Moving folder to Trash…"
+                    } else if self.running() {
                         if self.progress.measuring {
                             "Measuring folder"
                         } else {
@@ -936,10 +981,46 @@ impl App {
         }
     }
 
+    fn move_to_trash(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        match std::thread::Builder::new()
+            .name("move-to-trash".into())
+            .spawn(move || {
+                let result = trash_folder(&path);
+                let _ = sender.send((path, result));
+                ctx.request_repaint();
+            }) {
+            Ok(_) => self.trash_receiver = Some(receiver),
+            Err(error) => self.notice = Some(format!("Could not start Trash operation: {error}")),
+        }
+    }
+
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.pending_delete.clone() {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            let response = egui::Modal::new(egui::Id::new("confirm_delete")).show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.heading("Move folder to Trash?");
+                ui.label("The entire folder and everything inside it will be moved to Trash:");
+                ui.label(RichText::new(path.to_string_lossy()).monospace());
+                ui.label("Other apps or projects may depend on these files. Space is reclaimed when Trash is emptied.");
+                ui.horizontal(|ui| {
+                    cancelled = ui.button("Cancel").clicked();
+                    confirmed = ui.button("Move to Trash").clicked();
+                });
+            });
+            if confirmed {
+                self.pending_delete = None;
+                self.move_to_trash(path, ctx);
+            } else if cancelled || response.should_close() {
+                self.pending_delete = None;
+            }
+        }
         egui::Window::new("About & scan access").open(&mut self.show_help).resizable(false).default_width(480.0).show(ctx, |ui| {
             ui.heading("Find Dev Data");
-            ui.label("A local, read-only view of developer artifacts and downloaded AI models. Nothing is uploaded or deleted.");
+            ui.label("A local view of developer artifacts and downloaded AI models. Nothing is uploaded. You can move a folder to Trash after confirming its path.");
             ui.separator();
             ui.label(RichText::new("Scanning your whole Mac").strong());
             ui.label("Choose Entire disk to search /. Hidden folders are included. External volumes are optional. macOS may deny access to protected folders.");
@@ -970,7 +1051,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive();
-        if self.running() {
+        if self.running() || self.trash_receiver.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
         self.sidebar(ui);
@@ -1030,4 +1111,49 @@ fn short_path(path: &Path, home: Option<&Path>) -> String {
         return format!("~/{}", rest.display());
     }
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn trash_folder(path: &Path) -> Result<(), String> {
+    use objc2_foundation::{NSFileManager, NSString, NSURL};
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.file_type().is_dir() {
+        return Err("The path is no longer a folder. Scan again before deleting.".into());
+    }
+    let path = path
+        .to_str()
+        .ok_or("The folder path cannot be represented as text.")?;
+    objc2::rc::autoreleasepool(|_| {
+        let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true);
+        NSFileManager::defaultManager()
+            .trashItemAtURL_resultingItemURL_error(&url, None)
+            .map_err(|error| error.localizedDescription().to_string())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_folder(_path: &Path) -> Result<(), String> {
+    Err("Moving folders to Trash is only supported on macOS.".into())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::trash_folder;
+    use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn trash_rejects_missing_files_and_replaced_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        fs::write(&file, "keep").unwrap();
+        let link = temp.path().join("link");
+        symlink(temp.path(), &link).unwrap();
+
+        assert!(trash_folder(&temp.path().join("missing")).is_err());
+        assert!(trash_folder(&file).is_err());
+        assert!(trash_folder(&link).is_err());
+        assert!(file.exists());
+        assert!(link.is_symlink());
+    }
 }

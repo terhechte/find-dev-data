@@ -2,6 +2,8 @@
 
 A native macOS desktop app written in Rust with **egui / eframe**. Find developer dependencies, build artifacts, tool caches, and local AI models, with a size for each folder.
 
+![Find Dev Data showing disk scan results](docs/screenshot.jpg)
+
 ## Run
 
 Requires macOS, Rust 1.92 or later, and the Xcode Command Line Tools.
@@ -27,7 +29,7 @@ Choose **Entire disk**, **Home folder**, or a custom folder, then **Start scan**
 - Click Folder, Tool, or Size to sort. The list virtualizes rows for large result sets.
 - Switch between **File size** and **Space on disk**.
 - Select a row for both sizes, file count, and measurement notes.
-- Reveal a folder in Finder, or copy its full path from the context menu.
+- Reveal a folder in Finder, copy its full path from the context menu, or move the entire folder to Trash after confirming its path. Deletion is available after the scan finishes.
 - Export the visible, sorted results as CSV, including raw byte counts and completion status.
 - Scan settings and window geometry persist between launches. Scan results do not.
 
@@ -57,7 +59,7 @@ Default locations follow upstream documentation: [LM Studio](https://lmstudio.ai
 
 ## Measurement semantics
 
-- This app only reads your disk; it does not delete files, execute project code, invoke package managers, or contact model services.
+- Scanning reads your disk without executing project code, invoking package managers, or contacting model services. The Delete button moves a confirmed folder and all its contents to Trash; empty Trash to reclaim the space.
 - File size sums regular-file lengths. Space on disk sums allocated blocks (`st_blocks × 512`). Directory metadata is not included.
 - Symlinks are not followed or added to sizes. A selected root or configured store root is canonicalized once, allowing a relocated top-level store to be measured if it is within the selected scope.
 - Hard-linked files count once within a finding. Hard links shared across separate rows and APFS clones cannot be attributed uniquely, so totals can overstate physical usage. These numbers are **not guaranteed reclaimable space**.
